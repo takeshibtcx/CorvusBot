@@ -1,3 +1,6 @@
+import subprocess
+subprocess.run(["pip", "install", "python-telegram-bot==21.6"], check=True)
+
 """
 ╔══════════════════════════════════════════════╗
 ║         CORVUS AREA BOT — TAM SÜRÜM          ║
