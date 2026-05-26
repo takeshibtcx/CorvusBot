@@ -409,6 +409,8 @@ async def puan_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════
 # DAVETİYE SİSTEMİ (REFERRAL)
 # ══════════════════════════════════════════════
+GROUP_LINK = "https://t.me/corvusarea"
+
 async def start_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if context.args and context.args[0].startswith("ref_"):
@@ -420,12 +422,14 @@ async def start_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if not mevcut:
                         c.execute("INSERT OR IGNORE INTO referrals(user_id, ref_by) VALUES(?,?)",
                                   (user.id, ref_by))
-                await update.message.reply_text(
-                    "✅ Davet linki kaydedildi!\n"
-                    "Gruba katıldığında davet eden *+10 puan* kazanacak.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🦅 Gruba Katıl", url=GROUP_LINK)]
+            ])
+            await update.message.reply_text(
+                "✅ Davet kaydedildi! Aşağıdan gruba katıl:",
+                reply_markup=keyboard
+            )
+            return
         except:
             pass
     await update.message.reply_text(YARDIM_METNI, parse_mode=ParseMode.MARKDOWN)
