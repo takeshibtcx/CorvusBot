@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # AYARLAR
 # ══════════════════════════════════════════════
 BOT_TOKEN    = "8807959815:AAFNbPD_WiD-i1I6i5dXsKjEWt7VlutmT-s"     # @BotFather'dan al
-ADMIN_IDS    = [@takeshibtc]            # Senin Telegram ID'n
+ADMIN_IDS    = [1240615302]
 LOG_CHAT_ID  = None                   # Log kanalı ID (opsiyonel, örn: -100123456)
 
 MESAJ_PUANI         = 2
