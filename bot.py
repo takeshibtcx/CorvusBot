@@ -30,14 +30,14 @@ logger = logging.getLogger(__name__)
 # ══════════════════════════════════════════════
 # AYARLAR
 # ══════════════════════════════════════════════
-BOT_TOKEN    = "8807959815:AAFNbPD_WiD-i1I6i5dXsKjEWt7VlutmT-s"     # @BotFather'dan al
+BOT_TOKEN    = "8807959815:AAFNbPD_WiD-i1I6i5dXsKjEWt7VlutmT-s"
 ADMIN_IDS    = [1240615302]
-LOG_CHAT_ID  = None                   # Log kanalı ID (opsiyonel, örn: -100123456)
+LOG_CHAT_ID  = None
 
 MESAJ_PUANI         = 2
 DAVET_PUANI         = 10
 MIN_MESAJ_UZUNLUGU  = 10
-COOLDOWN_SANIYE     = 15              # 15 saniye cooldown
+COOLDOWN_SANIYE     = 15
 
 SPAM_KELIMELER = {
     "selam","merhaba","sa","hey","hi","hello","slm","günaydın","gunaydin",
@@ -108,6 +108,10 @@ def db_init():
             lock_turu   TEXT,
             PRIMARY KEY(chat_id, lock_turu)
         );
+        CREATE TABLE IF NOT EXISTS referrals (
+            user_id     INTEGER PRIMARY KEY,
+            ref_by      INTEGER
+        );
         """)
 
 def ayar_al(chat_id: int, anahtar: str, varsayilan: str = None):
@@ -155,7 +159,6 @@ def admin_gerekli(func):
     return wrapper
 
 def sure_parse(sure_str: str):
-    """'2h', '3d', '30m', '1w' → timedelta"""
     m = re.match(r"^(\d+)([mhdw])$", sure_str.lower())
     if not m:
         return None
@@ -206,9 +209,8 @@ async def mesaj_sayici(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     metin = update.message.text or update.message.caption or ""
-
-    # Blocklist kontrolü
     chat_id = update.effective_chat.id
+
     with db() as c:
         bl = c.execute("SELECT kelime FROM blocklist WHERE chat_id=?", (chat_id,)).fetchall()
     for row in bl:
@@ -216,14 +218,12 @@ async def mesaj_sayici(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.delete()
             return
 
-    # Filtre kontrolü
     with db() as c:
         flt = c.execute("SELECT * FROM filters WHERE chat_id=?", (chat_id,)).fetchall()
     for row in flt:
         if row["kelime"].lower() in metin.lower():
             await update.message.reply_text(row["yanit"])
 
-    # Antiflood kontrolü
     flood_limit = ayar_al(chat_id, "flood_limit")
     if flood_limit:
         key = f"flood_{chat_id}_{user.id}"
@@ -276,7 +276,6 @@ async def yeni_uye_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     yeni_uye   = result.new_chat_member.user
     chat_id    = result.chat.id
 
-    # Karşılama mesajı
     hosgeldin = ayar_al(chat_id, "welcome")
     if hosgeldin:
         metin = hosgeldin.replace("{name}", f"[{yeni_uye.full_name}](tg://user?id={yeni_uye.id})")
@@ -286,6 +285,25 @@ async def yeni_uye_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if not davet_eden or davet_eden.is_bot or davet_eden.id == yeni_uye.id:
+        # Referral link ile gelmiş olabilir
+        with db() as c:
+            ref = c.execute("SELECT ref_by FROM referrals WHERE user_id=?",
+                            (yeni_uye.id,)).fetchone()
+        if ref:
+            ref_by_id = ref["ref_by"]
+            kullanici_al_veya_olustur(ref_by_id, None, f"ID:{ref_by_id}")
+            with db() as c:
+                c.execute("UPDATE users SET puan=puan+?, davet_sayisi=davet_sayisi+1 WHERE user_id=?",
+                          (DAVET_PUANI, ref_by_id))
+                davet_eden_row = c.execute("SELECT full_name FROM users WHERE user_id=?",
+                                           (ref_by_id,)).fetchone()
+            davet_isim = davet_eden_row["full_name"] if davet_eden_row else f"ID:{ref_by_id}"
+            await context.bot.send_message(
+                chat_id,
+                f"👋 *{yeni_uye.full_name}* gruba katıldı!\n"
+                f"Davet eden: *{davet_isim}* → *+{DAVET_PUANI} puan* 🎉",
+                parse_mode=ParseMode.MARKDOWN
+            )
         return
 
     kullanici_al_veya_olustur(davet_eden.id, davet_eden.username, davet_eden.full_name)
@@ -389,10 +407,58 @@ async def puan_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ══════════════════════════════════════════════
+# DAVETİYE SİSTEMİ (REFERRAL)
+# ══════════════════════════════════════════════
+async def start_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if context.args and context.args[0].startswith("ref_"):
+        try:
+            ref_by = int(context.args[0].split("_")[1])
+            if ref_by != user.id:
+                with db() as c:
+                    mevcut = c.execute("SELECT 1 FROM referrals WHERE user_id=?", (user.id,)).fetchone()
+                    if not mevcut:
+                        c.execute("INSERT OR IGNORE INTO referrals(user_id, ref_by) VALUES(?,?)",
+                                  (user.id, ref_by))
+                await update.message.reply_text(
+                    "✅ Davet linki kaydedildi!\n"
+                    "Gruba katıldığında davet eden *+10 puan* kazanacak.",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+        except:
+            pass
+    await update.message.reply_text(YARDIM_METNI, parse_mode=ParseMode.MARKDOWN)
+
+async def davetlink_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user     = update.effective_user
+    bot_info = await context.bot.get_me()
+    link     = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
+    await update.message.reply_text(
+        f"🔗 *Kişisel Davet Linkin*\n\n"
+        f"`{link}`\n\n"
+        f"Bu linki paylaş → arkadaşın gruba katılınca *+{DAVET_PUANI} puan* kazanırsın!\n"
+        f"📊 İstatistiklerin için: `/davetim`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def davet_istatistik_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    with db() as c:
+        sayi = c.execute("SELECT COUNT(*) as cnt FROM referrals WHERE ref_by=?",
+                         (user.id,)).fetchone()["cnt"]
+    await update.message.reply_text(
+        f"👥 *Davet İstatistiklerin*\n\n"
+        f"Toplam davet: *{sayi}* kişi\n"
+        f"Kazanılan puan: *{sayi * DAVET_PUANI}*\n\n"
+        f"Davet linkin için: `/davetlink`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ══════════════════════════════════════════════
 # MODERASYON — BAN / MUTE / KICK
 # ══════════════════════════════════════════════
 def hedef_al(update: Update, context):
-    """Reply veya args'tan hedef user_id döndür"""
     if update.message.reply_to_message:
         u = update.message.reply_to_message.from_user
         sebep = " ".join(context.args) if context.args else ""
@@ -413,13 +479,12 @@ async def ban_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not uid:
         await update.message.reply_text("Bir kullanıcıyı yanıtla veya ID/kullanıcı adı ver.")
         return
-    chat = update.effective_chat
     try:
-        await chat.ban_member(uid)
+        await update.effective_chat.ban_member(uid)
         metin = f"🚫 *{isim}* banlandı."
         if sebep: metin += f"\nSebep: {sebep}"
         await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
-        await log_gonder(context, f"🚫 BAN | {isim} | {chat.title} | Sebep: {sebep or '-'}")
+        await log_gonder(context, f"🚫 BAN | {isim} | {update.effective_chat.title} | Sebep: {sebep or '-'}")
     except Exception as e:
         await update.message.reply_text(f"❌ Hata: {e}")
 
@@ -429,8 +494,6 @@ async def tban_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not uid or not context.args:
         await update.message.reply_text("Kullanım: `/tban @user 2h sebep`", parse_mode=ParseMode.MARKDOWN)
         return
-    sure_arg = context.args[1] if update.message.reply_to_message else context.args[1] if len(context.args) > 1 else context.args[0]
-    # reply ise args[0] süre, yoksa args[1]
     if update.message.reply_to_message:
         sure_arg = context.args[0] if context.args else None
         sebep    = " ".join(context.args[1:])
@@ -438,7 +501,7 @@ async def tban_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sure_arg = context.args[1] if len(context.args) > 1 else None
         sebep    = " ".join(context.args[2:])
     if not sure_arg:
-        await update.message.reply_text("Süre belirtmelisin. Örn: `2h`, `3d`, `30m`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Süre belirt: `2h`, `3d`, `30m`", parse_mode=ParseMode.MARKDOWN)
         return
     td = sure_parse(sure_arg)
     if not td:
@@ -473,14 +536,12 @@ async def dban_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sban_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, isim, sebep = hedef_al(update, context)
     if not uid:
-        await update.message.reply_text("Bir kullanıcıyı yanıtla.")
         return
     try:
         if update.message.reply_to_message:
             await update.message.reply_to_message.delete()
         await update.message.delete()
         await update.effective_chat.ban_member(uid)
-        # Sessiz — bildirim yok
     except:
         pass
 
@@ -507,7 +568,6 @@ async def mute_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         metin = f"🔇 *{isim}* susturuldu."
         if sebep: metin += f"\nSebep: {sebep}"
         await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
-        await log_gonder(context, f"🔇 MUTE | {isim} | {update.effective_chat.title}")
     except Exception as e:
         await update.message.reply_text(f"❌ {e}")
 
@@ -562,7 +622,7 @@ async def kick_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         await update.effective_chat.ban_member(uid)
-        await update.effective_chat.unban_member(uid)  # kick = ban + hemen unban
+        await update.effective_chat.unban_member(uid)
         metin = f"👢 *{isim}* gruptan atıldı."
         if sebep: metin += f"\nSebep: {sebep}"
         await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
@@ -570,17 +630,14 @@ async def kick_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
 
 # ══════════════════════════════════════════════
-# UYARILAR (WARNINGS)
+# UYARILAR
 # ══════════════════════════════════════════════
 @admin_gerekli
 async def warn_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid, isim, sebep = hedef_al(update, context)
     chat_id = update.effective_chat.id
-    if not uid:
+    if not uid or not isinstance(uid, int):
         await update.message.reply_text("Bir kullanıcıyı yanıtla.")
-        return
-    if not isinstance(uid, int):
-        await update.message.reply_text("Geçerli bir kullanıcı belirt.")
         return
     with db() as c:
         c.execute("INSERT INTO warns(chat_id,user_id,reason,tarih) VALUES(?,?,?,?)",
@@ -598,7 +655,7 @@ async def warn_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif mod == "kick":
             await update.effective_chat.ban_member(uid)
             await update.effective_chat.unban_member(uid)
-        else:  # mute (varsayılan)
+        else:
             await update.effective_chat.restrict_member(uid, ChatPermissions(can_send_messages=False))
         with db() as c:
             c.execute("DELETE FROM warns WHERE chat_id=? AND user_id=?", (chat_id, uid))
@@ -716,7 +773,6 @@ async def clearnote_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🗑 `{anahtar}` notu silindi.", parse_mode=ParseMode.MARKDOWN)
 
 async def hashtag_not_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """#notadi ile not çağır"""
     if not update.message or not update.message.text:
         return
     m = re.search(r"#(\w+)", update.message.text)
@@ -738,8 +794,8 @@ async def filter_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
         await update.message.reply_text("Kullanım: `/filter kelime yanıt`", parse_mode=ParseMode.MARKDOWN)
         return
-    kelime = context.args[0].lower()
-    yanit  = " ".join(context.args[1:])
+    kelime  = context.args[0].lower()
+    yanit   = " ".join(context.args[1:])
     chat_id = update.effective_chat.id
     with db() as c:
         c.execute("INSERT OR REPLACE INTO filters(chat_id,kelime,yanit) VALUES(?,?,?)",
@@ -772,7 +828,7 @@ async def filters_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # KURALLAR
 # ══════════════════════════════════════════════
 async def rules_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id  = update.effective_chat.id
     kurallar = ayar_al(chat_id, "rules")
     if kurallar:
         await update.message.reply_text(f"📜 *Grup Kuralları*\n\n{kurallar}", parse_mode=ParseMode.MARKDOWN)
@@ -784,56 +840,45 @@ async def setrules_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Kullanım: `/setrules kural metni`", parse_mode=ParseMode.MARKDOWN)
         return
-    kurallar = " ".join(context.args)
-    ayar_yaz(update.effective_chat.id, "rules", kurallar)
+    ayar_yaz(update.effective_chat.id, "rules", " ".join(context.args))
     await update.message.reply_text("✅ Kurallar güncellendi.", parse_mode=ParseMode.MARKDOWN)
 
 @admin_gerekli
 async def clearrules_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as c:
-        c.execute("DELETE FROM settings WHERE chat_id=? AND anahtar='rules'",
-                  (update.effective_chat.id,))
+        c.execute("DELETE FROM settings WHERE chat_id=? AND anahtar='rules'", (update.effective_chat.id,))
     await update.message.reply_text("🗑 Kurallar silindi.")
 
 # ══════════════════════════════════════════════
-# KİLİTLER (LOCKS)
+# KİLİTLER
 # ══════════════════════════════════════════════
 LOCK_TURLERI = {
-    "link":     "link içeren mesajlar",
-    "forward":  "yönlendirilen mesajlar",
-    "sticker":  "sticker mesajlar",
-    "gif":      "GIF mesajlar",
-    "photo":    "fotoğraf mesajlar",
-    "video":    "video mesajlar",
-    "audio":    "ses dosyaları",
-    "document": "döküman dosyaları",
-    "voice":    "sesli mesajlar",
-    "poll":     "anket mesajlar",
-    "bot":      "bot mesajları",
+    "link":"link içeren mesajlar","forward":"yönlendirilen mesajlar",
+    "sticker":"sticker mesajlar","gif":"GIF mesajlar","photo":"fotoğraf mesajlar",
+    "video":"video mesajlar","audio":"ses dosyaları","document":"döküman dosyaları",
+    "voice":"sesli mesajlar","poll":"anket mesajlar",
 }
 
 @admin_gerekli
 async def lock_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0] not in LOCK_TURLERI:
         liste = ", ".join(f"`{k}`" for k in LOCK_TURLERI)
-        await update.message.reply_text(f"Kullanım: `/lock tür`\nMevcut türler: {liste}", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"Kullanım: `/lock tür`\nTürler: {liste}", parse_mode=ParseMode.MARKDOWN)
         return
-    tur     = context.args[0]
-    chat_id = update.effective_chat.id
     with db() as c:
-        c.execute("INSERT OR IGNORE INTO locks(chat_id,lock_turu) VALUES(?,?)", (chat_id, tur))
-    await update.message.reply_text(f"🔒 `{tur}` kilitlendi.", parse_mode=ParseMode.MARKDOWN)
+        c.execute("INSERT OR IGNORE INTO locks(chat_id,lock_turu) VALUES(?,?)",
+                  (update.effective_chat.id, context.args[0]))
+    await update.message.reply_text(f"🔒 `{context.args[0]}` kilitlendi.", parse_mode=ParseMode.MARKDOWN)
 
 @admin_gerekli
 async def unlock_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Kullanım: `/unlock tür`", parse_mode=ParseMode.MARKDOWN)
         return
-    tur     = context.args[0]
-    chat_id = update.effective_chat.id
     with db() as c:
-        c.execute("DELETE FROM locks WHERE chat_id=? AND lock_turu=?", (chat_id, tur))
-    await update.message.reply_text(f"🔓 `{tur}` kilidi kaldırıldı.", parse_mode=ParseMode.MARKDOWN)
+        c.execute("DELETE FROM locks WHERE chat_id=? AND lock_turu=?",
+                  (update.effective_chat.id, context.args[0]))
+    await update.message.reply_text(f"🔓 `{context.args[0]}` kilidi kaldırıldı.", parse_mode=ParseMode.MARKDOWN)
 
 async def locks_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -846,39 +891,35 @@ async def locks_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"*Aktif Kilitler:*\n{liste}", parse_mode=ParseMode.MARKDOWN)
 
 async def kilit_kontrol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Mesajları kilit kurallarına göre sil"""
     if not update.message:
         return
     chat_id = update.effective_chat.id
     msg     = update.message
 
-    async def sil(sebep: str):
-        try:
-            await msg.delete()
-        except:
-            pass
+    async def sil():
+        try: await msg.delete()
+        except: pass
 
-    if kilitli_mi(chat_id, "link"):
-        if msg.text and re.search(r"(https?://|t\.me/|www\.)", msg.text or ""):
-            await sil("link"); return
+    if kilitli_mi(chat_id, "link") and msg.text and re.search(r"(https?://|t\.me/|www\.)", msg.text or ""):
+        await sil(); return
     if kilitli_mi(chat_id, "forward") and msg.forward_origin:
-        await sil("forward"); return
+        await sil(); return
     if kilitli_mi(chat_id, "sticker") and msg.sticker:
-        await sil("sticker"); return
+        await sil(); return
     if kilitli_mi(chat_id, "gif") and msg.animation:
-        await sil("gif"); return
+        await sil(); return
     if kilitli_mi(chat_id, "photo") and msg.photo:
-        await sil("photo"); return
+        await sil(); return
     if kilitli_mi(chat_id, "video") and msg.video:
-        await sil("video"); return
+        await sil(); return
     if kilitli_mi(chat_id, "audio") and msg.audio:
-        await sil("audio"); return
+        await sil(); return
     if kilitli_mi(chat_id, "document") and msg.document:
-        await sil("document"); return
+        await sil(); return
     if kilitli_mi(chat_id, "voice") and msg.voice:
-        await sil("voice"); return
+        await sil(); return
     if kilitli_mi(chat_id, "poll") and msg.poll:
-        await sil("poll"); return
+        await sil(); return
 
 # ══════════════════════════════════════════════
 # BLOCKLİST
@@ -908,8 +949,7 @@ async def rmbl_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bl_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     with db() as c:
-        rows = c.execute("SELECT kelime FROM blocklist WHERE chat_id=? ORDER BY kelime",
-                         (chat_id,)).fetchall()
+        rows = c.execute("SELECT kelime FROM blocklist WHERE chat_id=? ORDER BY kelime", (chat_id,)).fetchall()
     if not rows:
         await update.message.reply_text("Blocklist boş.")
         return
@@ -922,22 +962,17 @@ async def bl_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_gerekli
 async def setwelcome_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(
-            "Kullanım: `/setwelcome Merhaba {name}, gruba hoş geldin!`\n`{name}` → yeni üyenin adı",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text("Kullanım: `/setwelcome Merhaba {name}!`", parse_mode=ParseMode.MARKDOWN)
         return
-    metin = " ".join(context.args)
-    ayar_yaz(update.effective_chat.id, "welcome", metin)
+    ayar_yaz(update.effective_chat.id, "welcome", " ".join(context.args))
     await update.message.reply_text("✅ Karşılama mesajı ayarlandı.", parse_mode=ParseMode.MARKDOWN)
 
 @admin_gerekli
 async def setgoodbye_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Kullanım: `/setgoodbye {name} gruptan ayrıldı.`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Kullanım: `/setgoodbye {name} ayrıldı.`", parse_mode=ParseMode.MARKDOWN)
         return
-    metin = " ".join(context.args)
-    ayar_yaz(update.effective_chat.id, "goodbye", metin)
+    ayar_yaz(update.effective_chat.id, "goodbye", " ".join(context.args))
     await update.message.reply_text("✅ Veda mesajı ayarlandı.", parse_mode=ParseMode.MARKDOWN)
 
 @admin_gerekli
@@ -959,7 +994,7 @@ async def setflood_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not context.args:
         limit = ayar_al(chat_id, "flood_limit") or "Kapalı"
-        await update.message.reply_text(f"Mevcut flood limiti: *{limit}*\nKapatmak: `/setflood off`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"Flood limiti: *{limit}*", parse_mode=ParseMode.MARKDOWN)
         return
     if context.args[0].lower() == "off":
         with db() as c:
@@ -969,21 +1004,21 @@ async def setflood_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         limit = int(context.args[0])
         ayar_yaz(chat_id, "flood_limit", str(limit))
-        await update.message.reply_text(f"✅ Flood limiti *{limit}* mesaj/10sn olarak ayarlandı.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(f"✅ Flood limiti *{limit}* mesaj/10sn.", parse_mode=ParseMode.MARKDOWN)
     except:
         await update.message.reply_text("Geçerli bir sayı gir.")
 
 # ══════════════════════════════════════════════
-# TEMIZLE (PURGE)
+# PURGE & PIN
 # ══════════════════════════════════════════════
 @admin_gerekli
 async def purge_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
         await update.message.reply_text("Silinecek ilk mesajı yanıtla.")
         return
-    baslangic = update.message.reply_to_message.message_id
-    bitis     = update.message.message_id
-    chat_id   = update.effective_chat.id
+    baslangic   = update.message.reply_to_message.message_id
+    bitis       = update.message.message_id
+    chat_id     = update.effective_chat.id
     silinebilir = 0
     for msg_id in range(baslangic, bitis + 1):
         try:
@@ -991,17 +1026,12 @@ async def purge_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             silinebilir += 1
         except:
             pass
-    bildirim = await update.effective_chat.send_message(f"🗑 {silinebilir} mesaj silindi.")
     import asyncio
+    bildirim = await update.effective_chat.send_message(f"🗑 {silinebilir} mesaj silindi.")
     await asyncio.sleep(3)
-    try:
-        await bildirim.delete()
-    except:
-        pass
+    try: await bildirim.delete()
+    except: pass
 
-# ══════════════════════════════════════════════
-# PİN
-# ══════════════════════════════════════════════
 @admin_gerekli
 async def pin_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
@@ -1027,30 +1057,25 @@ async def unpin_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {e}")
 
 # ══════════════════════════════════════════════
-# RAPOR
+# RAPOR & YÖNETİCİ & BİLGİ
 # ══════════════════════════════════════════════
 async def report_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
         await update.message.reply_text("Raporlamak istediğin mesajı yanıtla.")
         return
-    sorunlu  = update.message.reply_to_message.from_user
+    sorunlu    = update.message.reply_to_message.from_user
     raporlayan = update.effective_user
-    chat_id   = update.effective_chat.id
-    admins    = await update.effective_chat.get_administrators()
-    admin_str = " ".join(f"[{a.user.first_name}](tg://user?id={a.user.id})" for a in admins if not a.user.is_bot)
-    sebep = " ".join(context.args) if context.args else "-"
+    admins     = await update.effective_chat.get_administrators()
+    admin_str  = " ".join(f"[{a.user.first_name}](tg://user?id={a.user.id})" for a in admins if not a.user.is_bot)
+    sebep      = " ".join(context.args) if context.args else "-"
     await update.effective_chat.send_message(
         f"🚨 *Rapor*\n\n"
         f"Şikayet eden: [{raporlayan.full_name}](tg://user?id={raporlayan.id})\n"
         f"Şikayet edilen: [{sorunlu.full_name}](tg://user?id={sorunlu.id})\n"
-        f"Sebep: {sebep}\n\n"
-        f"Yöneticiler: {admin_str}",
+        f"Sebep: {sebep}\n\nYöneticiler: {admin_str}",
         parse_mode=ParseMode.MARKDOWN
     )
 
-# ══════════════════════════════════════════════
-# YÖNETİCİ LİSTESİ
-# ══════════════════════════════════════════════
 async def admins_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     admins = await update.effective_chat.get_administrators()
     metin  = "👑 *Yöneticiler:*\n\n"
@@ -1059,35 +1084,31 @@ async def admins_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             metin += f"• [{a.user.full_name}](tg://user?id={a.user.id})\n"
     await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
 
-# ══════════════════════════════════════════════
-# KULLANICI BİLGİSİ
-# ══════════════════════════════════════════════
 async def info_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message:
-        u = update.message.reply_to_message.from_user
-    else:
-        u = update.effective_user
+    u       = update.message.reply_to_message.from_user if update.message.reply_to_message else update.effective_user
     chat_id = update.effective_chat.id
     with db() as c:
         warns_count = c.execute("SELECT COUNT(*) as cnt FROM warns WHERE chat_id=? AND user_id=?",
                                 (chat_id, u.id)).fetchone()["cnt"]
         ku = c.execute("SELECT * FROM users WHERE user_id=?", (u.id,)).fetchone()
     puan = ku["puan"] if ku else 0
-    metin = (
+    await update.message.reply_text(
         f"👤 *Kullanıcı Bilgisi*\n\n"
         f"Ad: [{u.full_name}](tg://user?id={u.id})\n"
         f"ID: `{u.id}`\n"
         f"Kullanıcı adı: @{u.username or '-'}\n"
         f"⭐ Puan: *{puan}*\n"
-        f"⚠️ Uyarı: *{warns_count}*"
+        f"⚠️ Uyarı: *{warns_count}*",
+        parse_mode=ParseMode.MARKDOWN
     )
-    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
 
 async def id_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.reply_to_message:
-        u   = update.message.reply_to_message.from_user
-        cid = update.effective_chat.id
-        await update.message.reply_text(f"Kullanıcı ID: `{u.id}`\nGrup ID: `{cid}`", parse_mode=ParseMode.MARKDOWN)
+        u = update.message.reply_to_message.from_user
+        await update.message.reply_text(
+            f"Kullanıcı ID: `{u.id}`\nGrup ID: `{update.effective_chat.id}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
     else:
         await update.message.reply_text(
             f"Kullanıcı ID: `{update.effective_user.id}`\nGrup ID: `{update.effective_chat.id}`",
@@ -1103,9 +1124,11 @@ YARDIM_METNI = """
 ━━━ 📊 PUAN SİSTEMİ ━━━
 `/puan` — Kendi puanını görüntüle
 `/siralama` — Genel puan sıralaması
-`/siralama_mesaj` — Aktiflik sıralaması (mesaj)
+`/siralama_mesaj` — Aktiflik sıralaması
 `/siralama_davet` — Davetçi sıralaması
-`/puanver` [reply] — Admin: kullanıcıya puan ver
+`/puanver` [reply] — Admin: puan ver
+`/davetlink` — Kişisel davet linkini al
+`/davetim` — Davet istatistiklerin
 
 ━━━ 🔨 MODERASYON ━━━
 `/ban` `/tban` `/dban` `/sban` — Banlama
@@ -1134,14 +1157,12 @@ YARDIM_METNI = """
 `/lock [tür]` — İçerik kilitle
 `/unlock [tür]` — Kilidi kaldır
 `/locks` — Aktif kilitler
-Türler: link, forward, sticker, gif, photo, video, audio, document, voice, poll
 
 ━━━ 📜 KURALLAR & AYARLAR ━━━
 `/rules` — Grup kuralları
 `/setrules` — Kural yaz (admin)
 `/setwelcome` — Karşılama mesajı
 `/setgoodbye` — Veda mesajı
-`/welcome off` — Karşılamayı kapat
 `/setflood [sayi|off]` — Flood limiti
 `/purge` [reply] — Mesajları sil
 `/pin` [reply] — Mesajı pinle
@@ -1154,9 +1175,6 @@ Türler: link, forward, sticker, gif, photo, video, audio, document, voice, poll
 `/id` — ID bilgisi
 """
 
-async def yardim_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(YARDIM_METNI, parse_mode=ParseMode.MARKDOWN)
-
 # ══════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════
@@ -1164,79 +1182,62 @@ def main():
     db_init()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Puan & genel
+    app.add_handler(CommandHandler("start",           start_komutu))
+    app.add_handler(CommandHandler("yardim",          yardim_komutu := lambda u,c: u.message.reply_text(YARDIM_METNI, parse_mode=ParseMode.MARKDOWN)))
     app.add_handler(CommandHandler("puan",            puan_komutu))
     app.add_handler(CommandHandler("siralama",        siralama_genel))
     app.add_handler(CommandHandler("siralama_mesaj",  siralama_mesaj))
     app.add_handler(CommandHandler("siralama_davet",  siralama_davet))
     app.add_handler(CommandHandler("puanver",         puan_ver))
-    app.add_handler(CommandHandler("yardim",          yardim_komutu))
-    app.add_handler(CommandHandler("start",           yardim_komutu))
+    app.add_handler(CommandHandler("davetlink",       davetlink_komutu))
+    app.add_handler(CommandHandler("davetim",         davet_istatistik_komutu))
+    app.add_handler(CommandHandler("ban",             ban_komutu))
+    app.add_handler(CommandHandler("tban",            tban_komutu))
+    app.add_handler(CommandHandler("dban",            dban_komutu))
+    app.add_handler(CommandHandler("sban",            sban_komutu))
+    app.add_handler(CommandHandler("unban",           unban_komutu))
+    app.add_handler(CommandHandler("mute",            mute_komutu))
+    app.add_handler(CommandHandler("tmute",           tmute_komutu))
+    app.add_handler(CommandHandler("unmute",          unmute_komutu))
+    app.add_handler(CommandHandler("kick",            kick_komutu))
+    app.add_handler(CommandHandler("warn",            warn_komutu))
+    app.add_handler(CommandHandler("unwarn",          unwarn_komutu))
+    app.add_handler(CommandHandler("warns",           warns_komutu))
+    app.add_handler(CommandHandler("warnlimit",       warnlimit_komutu))
+    app.add_handler(CommandHandler("warnmode",        warnmode_komutu))
+    app.add_handler(CommandHandler("save",            save_komutu))
+    app.add_handler(CommandHandler("get",             get_komutu))
+    app.add_handler(CommandHandler("notes",           notes_komutu))
+    app.add_handler(CommandHandler("clearnote",       clearnote_komutu))
+    app.add_handler(CommandHandler("filter",          filter_komutu))
+    app.add_handler(CommandHandler("stop",            stop_komutu))
+    app.add_handler(CommandHandler("filters",         filters_komutu))
+    app.add_handler(CommandHandler("addbl",           addbl_komutu))
+    app.add_handler(CommandHandler("rmbl",            rmbl_komutu))
+    app.add_handler(CommandHandler("bl",              bl_komutu))
+    app.add_handler(CommandHandler("lock",            lock_komutu))
+    app.add_handler(CommandHandler("unlock",          unlock_komutu))
+    app.add_handler(CommandHandler("locks",           locks_komutu))
+    app.add_handler(CommandHandler("rules",           rules_komutu))
+    app.add_handler(CommandHandler("setrules",        setrules_komutu))
+    app.add_handler(CommandHandler("clearrules",      clearrules_komutu))
+    app.add_handler(CommandHandler("setwelcome",      setwelcome_komutu))
+    app.add_handler(CommandHandler("setgoodbye",      setgoodbye_komutu))
+    app.add_handler(CommandHandler("welcome",         welcome_komutu))
+    app.add_handler(CommandHandler("setflood",        setflood_komutu))
+    app.add_handler(CommandHandler("purge",           purge_komutu))
+    app.add_handler(CommandHandler("pin",             pin_komutu))
+    app.add_handler(CommandHandler("unpin",           unpin_komutu))
+    app.add_handler(CommandHandler("admins",          admins_komutu))
+    app.add_handler(CommandHandler("report",          report_komutu))
+    app.add_handler(CommandHandler("info",            info_komutu))
+    app.add_handler(CommandHandler("id",              id_komutu))
 
-    # Moderasyon
-    app.add_handler(CommandHandler("ban",     ban_komutu))
-    app.add_handler(CommandHandler("tban",    tban_komutu))
-    app.add_handler(CommandHandler("dban",    dban_komutu))
-    app.add_handler(CommandHandler("sban",    sban_komutu))
-    app.add_handler(CommandHandler("unban",   unban_komutu))
-    app.add_handler(CommandHandler("mute",    mute_komutu))
-    app.add_handler(CommandHandler("tmute",   tmute_komutu))
-    app.add_handler(CommandHandler("unmute",  unmute_komutu))
-    app.add_handler(CommandHandler("kick",    kick_komutu))
-
-    # Uyarılar
-    app.add_handler(CommandHandler("warn",      warn_komutu))
-    app.add_handler(CommandHandler("unwarn",    unwarn_komutu))
-    app.add_handler(CommandHandler("warns",     warns_komutu))
-    app.add_handler(CommandHandler("warnlimit", warnlimit_komutu))
-    app.add_handler(CommandHandler("warnmode",  warnmode_komutu))
-
-    # Notlar
-    app.add_handler(CommandHandler("save",      save_komutu))
-    app.add_handler(CommandHandler("get",       get_komutu))
-    app.add_handler(CommandHandler("notes",     notes_komutu))
-    app.add_handler(CommandHandler("clearnote", clearnote_komutu))
-
-    # Filtreler
-    app.add_handler(CommandHandler("filter",  filter_komutu))
-    app.add_handler(CommandHandler("stop",    stop_komutu))
-    app.add_handler(CommandHandler("filters", filters_komutu))
-
-    # Blocklist
-    app.add_handler(CommandHandler("addbl", addbl_komutu))
-    app.add_handler(CommandHandler("rmbl",  rmbl_komutu))
-    app.add_handler(CommandHandler("bl",    bl_komutu))
-
-    # Kilitler
-    app.add_handler(CommandHandler("lock",   lock_komutu))
-    app.add_handler(CommandHandler("unlock", unlock_komutu))
-    app.add_handler(CommandHandler("locks",  locks_komutu))
-
-    # Kurallar & Ayarlar
-    app.add_handler(CommandHandler("rules",      rules_komutu))
-    app.add_handler(CommandHandler("setrules",   setrules_komutu))
-    app.add_handler(CommandHandler("clearrules", clearrules_komutu))
-    app.add_handler(CommandHandler("setwelcome", setwelcome_komutu))
-    app.add_handler(CommandHandler("setgoodbye", setgoodbye_komutu))
-    app.add_handler(CommandHandler("welcome",    welcome_komutu))
-    app.add_handler(CommandHandler("setflood",   setflood_komutu))
-    app.add_handler(CommandHandler("purge",      purge_komutu))
-    app.add_handler(CommandHandler("pin",        pin_komutu))
-    app.add_handler(CommandHandler("unpin",      unpin_komutu))
-
-    # Genel
-    app.add_handler(CommandHandler("admins", admins_komutu))
-    app.add_handler(CommandHandler("report", report_komutu))
-    app.add_handler(CommandHandler("info",   info_komutu))
-    app.add_handler(CommandHandler("id",     id_komutu))
-
-    # Mesaj handler'ları (sıra önemli)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, kilit_kontrol), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, hashtag_not_handler), group=2)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, mesaj_sayici), group=3)
 
-    # Üye olayları
-    app.add_handler(ChatMemberHandler(yeni_uye_handler,  ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(yeni_uye_handler,    ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(uye_ayrildi_handler, ChatMemberHandler.CHAT_MEMBER))
 
     logger.info("🦅 Corvus Area Bot başlatıldı!")
