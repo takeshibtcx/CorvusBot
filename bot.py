@@ -62,13 +62,25 @@ def db_init():
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            user_id     INTEGER PRIMARY KEY,
-            username    TEXT,
+            user_id         INTEGER PRIMARY KEY,
+            username        TEXT,
+            full_name       TEXT,
+            puan            INTEGER DEFAULT 0,
+            mesaj_sayisi    INTEGER DEFAULT 0,
+            davet_sayisi    INTEGER DEFAULT 0,
+            son_mesaj       TEXT,
+            aylik_puan      INTEGER DEFAULT 0,
+            aylik_mesaj     INTEGER DEFAULT 0,
+            aylik_davet     INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS aylik_arsiv (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ay          TEXT,
+            user_id     INTEGER,
             full_name   TEXT,
-            puan        INTEGER DEFAULT 0,
-            mesaj_sayisi INTEGER DEFAULT 0,
-            davet_sayisi INTEGER DEFAULT 0,
-            son_mesaj   TEXT
+            puan        INTEGER,
+            mesaj       INTEGER,
+            davet       INTEGER
         );
         CREATE TABLE IF NOT EXISTS warns (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -134,6 +146,16 @@ def kullanici_al_veya_olustur(user_id, username, full_name):
                 username=excluded.username,
                 full_name=excluded.full_name
         """, (user_id, username or full_name, full_name))
+        # Yeni kolonları ekle (eski DB için migration)
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN aylik_puan INTEGER DEFAULT 0")
+        except: pass
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN aylik_mesaj INTEGER DEFAULT 0")
+        except: pass
+        try:
+            c.execute("ALTER TABLE users ADD COLUMN aylik_davet INTEGER DEFAULT 0")
+        except: pass
         return c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
 # ══════════════════════════════════════════════
@@ -261,9 +283,11 @@ async def mesaj_sayici(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     with db() as c:
         c.execute("""
-            UPDATE users SET puan=puan+?, mesaj_sayisi=mesaj_sayisi+1, son_mesaj=?
+            UPDATE users SET
+                puan=puan+?, mesaj_sayisi=mesaj_sayisi+1, son_mesaj=?,
+                aylik_puan=aylik_puan+?, aylik_mesaj=aylik_mesaj+1
             WHERE user_id=?
-        """, (MESAJ_PUANI, datetime.utcnow().isoformat(), user.id))
+        """, (MESAJ_PUANI, datetime.utcnow().isoformat(), MESAJ_PUANI, user.id))
 
 async def yeni_uye_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.chat_member
@@ -308,8 +332,9 @@ async def yeni_uye_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kullanici_al_veya_olustur(davet_eden.id, davet_eden.username, davet_eden.full_name)
     with db() as c:
-        c.execute("UPDATE users SET puan=puan+?, davet_sayisi=davet_sayisi+1 WHERE user_id=?",
-                  (DAVET_PUANI, davet_eden.id))
+        c.execute("""UPDATE users SET puan=puan+?, davet_sayisi=davet_sayisi+1,
+                      aylik_puan=aylik_puan+?, aylik_davet=aylik_davet+1 WHERE user_id=?""",
+                  (DAVET_PUANI, DAVET_PUANI, davet_eden.id))
 
     await context.bot.send_message(
         chat_id,
@@ -390,6 +415,95 @@ async def siralama_davet(update: Update, context: ContextTypes.DEFAULT_TYPE):
         metin += f"{m} {k['full_name']} — *{k['davet_sayisi']}* davet (+{k['davet_sayisi']*DAVET_PUANI} puan)\n"
     await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
 
+async def aylik_siralama_genel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY aylik_puan DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.message.reply_text("Bu ay henüz puan yok.")
+        return
+    ay = datetime.utcnow().strftime("%B %Y")
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"🏆 *{ay} — AYLIK GENEL SIRALAMA*\n\n"
+    for i, k in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {k['full_name']} — *{k['aylik_puan']} puan*\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
+
+async def aylik_siralama_mesaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY aylik_mesaj DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.message.reply_text("Bu ay henüz mesaj yok.")
+        return
+    ay = datetime.utcnow().strftime("%B %Y")
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"💬 *{ay} — AYLIK AKTİFLİK*\n\n"
+    for i, k in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {k['full_name']} — *{k['aylik_mesaj']}* mesaj\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
+
+async def aylik_siralama_davet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY aylik_davet DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.message.reply_text("Bu ay henüz davet yok.")
+        return
+    ay = datetime.utcnow().strftime("%B %Y")
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"👥 *{ay} — AYLIK DAVETÇİLER*\n\n"
+    for i, k in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {k['full_name']} — *{k['aylik_davet']}* davet\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
+
+def aylik_sifirla():
+    """Her ayın 1'inde çalışır, aylık verileri sıfırlar ve arşivler"""
+    ay = datetime.utcnow().strftime("%Y-%m")
+    with db() as c:
+        # Önce arşivle
+        rows = c.execute("SELECT * FROM users WHERE aylik_puan > 0").fetchall()
+        for r in rows:
+            c.execute(
+                "INSERT INTO aylik_arsiv(ay,user_id,full_name,puan,mesaj,davet) VALUES(?,?,?,?,?,?)",
+                (ay, r["user_id"], r["full_name"], r["aylik_puan"], r["aylik_mesaj"], r["aylik_davet"])
+            )
+        # Sonra sıfırla
+        c.execute("UPDATE users SET aylik_puan=0, aylik_mesaj=0, aylik_davet=0")
+    logger.info(f"Aylık veriler sıfırlandı ve arşivlendi: {ay}")
+
+async def aylik_sifirla_job(context: ContextTypes.DEFAULT_TYPE):
+    aylik_sifirla()
+    if LOG_CHAT_ID:
+        ay = datetime.utcnow().strftime("%B %Y")
+        await context.bot.send_message(
+            LOG_CHAT_ID,
+            f"🔄 *{ay}* aylık verileri sıfırlandı ve arşivlendi.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def arsiv_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ay = context.args[0] if context.args else datetime.utcnow().strftime("%Y-%m")
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM aylik_arsiv WHERE ay=? ORDER BY puan DESC LIMIT 10",
+            (ay,)
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text(f"❌  için arşiv bulunamadı. Format: ", parse_mode=ParseMode.MARKDOWN)
+        return
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"📁 *{ay} Arşivi*\n\n"
+    for i, r in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {r['full_name']} — *{r['puan']} puan* ({r['mesaj']} mesaj, {r['davet']} davet)\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
+
+@admin_gerekli
+async def manuel_sifirla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    aylik_sifirla()
+    await update.message.reply_text("✅ Aylık veriler sıfırlandı ve arşivlendi.")
+
 @admin_gerekli
 async def puan_ver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message.reply_to_message:
@@ -432,7 +546,33 @@ async def start_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         except:
             pass
-    await update.message.reply_text(YARDIM_METNI, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(
+        ANA_MENU_METNI,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=ana_menu_klavye()
+    )
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "menu_ana":
+        await query.edit_message_text(
+            ANA_MENU_METNI,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ana_menu_klavye()
+        )
+        return
+
+    kategori = data.replace("menu_", "")
+    if kategori in MENU_KATEGORILER:
+        k = MENU_KATEGORILER[kategori]
+        await query.edit_message_text(
+            k["metin"],
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=geri_klavye()
+        )
 
 async def davetlink_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user     = update.effective_user
@@ -1122,62 +1262,217 @@ async def id_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════
 # YARDIM
 # ══════════════════════════════════════════════
-YARDIM_METNI = """
-🦅 *CORVUS AREA BOT* — Komut Listesi
+MENU_KATEGORILER = {
+    "puan": {
+        "baslik": "📊 Puan Sistemi",
+        "metin": (
+            "📊 *PUAN SİSTEMİ*\n\n"
+            "`/puan` — Kendi puanını görüntüle\n"
+            "`/siralama` — Genel puan sıralaması\n"
+            "`/siralama_mesaj` — Aktiflik sıralaması\n"
+            "`/siralama_davet` — Davetçi sıralaması\n"
+            "`/aylik` — Aylık genel sıralama\n"
+            "`/aylik_mesaj` — Aylık aktiflik\n"
+            "`/aylik_davet` — Aylık davetçiler\n"
+            "`/arsiv 2025-01` — Geçmiş ay arşivi\n"
+            "`/davetlink` — Kişisel davet linkini al\n"
+            "`/davetim` — Davet istatistiklerin\n"
+            "`/puanver` [reply] — Admin: puan ver"
+        )
+    },
+    "mod": {
+        "baslik": "🔨 Moderasyon",
+        "metin": (
+            "🔨 *MODERASYON*\n\n"
+            "`/ban` — Kullanıcıyı banla\n"
+            "`/tban 2h` — Geçici banla\n"
+            "`/dban` — Mesajı sil + banla\n"
+            "`/sban` — Sessiz banla\n"
+            "`/unban` — Ban kaldır\n"
+            "`/mute` — Sustur\n"
+            "`/tmute 2h` — Geçici sustur\n"
+            "`/unmute` — Susturmayı kaldır\n"
+            "`/kick` — Gruptan at\n"
+            "`/warn` — Uyarı ver\n"
+            "`/unwarn` — Uyarı geri al\n"
+            "`/warns` — Uyarıları gör\n"
+            "`/warnlimit 3` — Uyarı limiti\n"
+            "`/warnmode ban|kick|mute` — Uyarı modu"
+        )
+    },
+    "notlar": {
+        "baslik": "📌 Notlar",
+        "metin": (
+            "📌 *NOTLAR*\n\n"
+            "`/save [ad] [içerik]` — Not kaydet\n"
+            "`/get [ad]` — Not çağır\n"
+            "`#notadi` — Hashtag ile çağır\n"
+            "`/notes` — Tüm notları listele\n"
+            "`/clearnote [ad]` — Not sil"
+        )
+    },
+    "filtreler": {
+        "baslik": "🔍 Filtreler",
+        "metin": (
+            "🔍 *FİLTRELER & BLOCKLİST*\n\n"
+            "`/filter [kelime] [yanıt]` — Filtre ekle\n"
+            "`/stop [kelime]` — Filtre sil\n"
+            "`/filters` — Filtreleri listele\n"
+            "`/addbl [kelime]` — Blocklist'e ekle\n"
+            "`/rmbl [kelime]` — Blocklist'ten çıkar\n"
+            "`/bl` — Blocklist'i görüntüle"
+        )
+    },
+    "kilitler": {
+        "baslik": "🔒 Kilitler",
+        "metin": (
+            "🔒 *KİLİTLER*\n\n"
+            "`/lock [tür]` — İçerik kilitle\n"
+            "`/unlock [tür]` — Kilidi kaldır\n"
+            "`/locks` — Aktif kilitler\n\n"
+            "Türler: `link` `forward` `sticker` `gif`\n"
+            "`photo` `video` `audio` `document` `voice` `poll`"
+        )
+    },
+    "kurallar": {
+        "baslik": "📜 Kurallar & Ayarlar",
+        "metin": (
+            "📜 *KURALLAR & AYARLAR*\n\n"
+            "`/rules` — Grup kuralları\n"
+            "`/setrules` — Kural yaz (admin)\n"
+            "`/clearrules` — Kuralları sil\n"
+            "`/setwelcome` — Karşılama mesajı\n"
+            "`/setgoodbye` — Veda mesajı\n"
+            "`/welcome off` — Karşılamayı kapat\n"
+            "`/setflood [sayi|off]` — Flood limiti\n"
+            "`/purge` [reply] — Mesajları sil\n"
+            "`/pin` [reply] — Mesajı pinle\n"
+            "`/unpin` — Mesajı unpin\n"
+            "`/sifirla` — Aylık verileri sıfırla (admin)"
+        )
+    },
+    "genel": {
+        "baslik": "👥 Genel",
+        "metin": (
+            "👥 *GENEL*\n\n"
+            "`/admins` — Yönetici listesi\n"
+            "`/report` [reply] — Yöneticiyi çağır\n"
+            "`/info` [reply] — Kullanıcı bilgisi\n"
+            "`/id` — ID bilgisi\n"
+            "`/davetlink` — Davet linkini al\n"
+            "`/davetim` — Davet istatistiklerin"
+        )
+    },
+}
 
-━━━ 📊 PUAN SİSTEMİ ━━━
-`/puan` — Kendi puanını görüntüle
-`/siralama` — Genel puan sıralaması
-`/siralama_mesaj` — Aktiflik sıralaması
-`/siralama_davet` — Davetçi sıralaması
-`/puanver` [reply] — Admin: puan ver
-`/davetlink` — Kişisel davet linkini al
-`/davetim` — Davet istatistiklerin
+def ana_menu_klavye():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Puan Sistemi", callback_data="menu_puan"),
+            InlineKeyboardButton("🔨 Moderasyon", callback_data="menu_mod"),
+        ],
+        [
+            InlineKeyboardButton("📌 Notlar", callback_data="menu_notlar"),
+            InlineKeyboardButton("🔍 Filtreler", callback_data="menu_filtreler"),
+        ],
+        [
+            InlineKeyboardButton("🔒 Kilitler", callback_data="menu_kilitler"),
+            InlineKeyboardButton("📜 Kurallar", callback_data="menu_kurallar"),
+        ],
+        [
+            InlineKeyboardButton("👥 Genel", callback_data="menu_genel"),
+        ],
+    ])
 
-━━━ 🔨 MODERASYON ━━━
-`/ban` `/tban` `/dban` `/sban` — Banlama
-`/unban` — Ban kaldır
-`/mute` `/tmute` `/unmute` — Sustur/çöz
-`/kick` — Gruptan at
-`/warn` `/unwarn` `/warns` — Uyarı sistemi
-`/warnlimit [sayi]` — Uyarı limiti
-`/warnmode ban|kick|mute` — Uyarı modu
+def geri_klavye():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀ Ana Menü", callback_data="menu_ana")]
+    ])
 
-━━━ 📌 NOTLAR ━━━
-`/save [ad] [içerik]` — Not kaydet
-`/get [ad]` ya da `#notadi` — Not çağır
-`/notes` — Tüm notları listele
-`/clearnote [ad]` — Not sil
+ANA_MENU_METNI = (
+    "🦅 *CORVUS AREA BOT*\n\n"
+    "Aşağıdan bir kategori seç:"
+)
 
-━━━ 🔍 FİLTRELER & BLOCKLİST ━━━
-`/filter [kelime] [yanıt]` — Filtre ekle
-`/stop [kelime]` — Filtre sil
-`/filters` — Filtreleri listele
-`/addbl [kelime]` — Blocklist'e ekle
-`/rmbl [kelime]` — Blocklist'ten çıkar
-`/bl` — Blocklist'i görüntüle
 
-━━━ 🔒 KİLİTLER ━━━
-`/lock [tür]` — İçerik kilitle
-`/unlock [tür]` — Kilidi kaldır
-`/locks` — Aktif kilitler
 
-━━━ 📜 KURALLAR & AYARLAR ━━━
-`/rules` — Grup kuralları
-`/setrules` — Kural yaz (admin)
-`/setwelcome` — Karşılama mesajı
-`/setgoodbye` — Veda mesajı
-`/setflood [sayi|off]` — Flood limiti
-`/purge` [reply] — Mesajları sil
-`/pin` [reply] — Mesajı pinle
-`/unpin` — Mesajı unpin
+async def aylik_siralama_genel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY aylik_puan DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.message.reply_text("Bu ay henüz puan yok.")
+        return
+    ay = datetime.utcnow().strftime("%B %Y")
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"🏆 *{ay} — AYLIK GENEL SIRALAMA*\n\n"
+    for i, k in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {k['full_name']} — *{k['aylik_puan']} puan*\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
 
-━━━ 👥 GENEL ━━━
-`/admins` — Yönetici listesi
-`/report` [reply] — Yöneticiyi çağır
-`/info` [reply] — Kullanıcı bilgisi
-`/id` — ID bilgisi
-"""
+async def aylik_siralama_mesaj(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY aylik_mesaj DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.message.reply_text("Bu ay henüz mesaj yok.")
+        return
+    ay = datetime.utcnow().strftime("%B %Y")
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"💬 *{ay} — AYLIK AKTİFLİK*\n\n"
+    for i, k in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {k['full_name']} — *{k['aylik_mesaj']}* mesaj\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
+
+async def aylik_siralama_davet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY aylik_davet DESC LIMIT 10").fetchall()
+    if not rows:
+        await update.message.reply_text("Bu ay henüz davet yok.")
+        return
+    ay = datetime.utcnow().strftime("%B %Y")
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"👥 *{ay} — AYLIK DAVETÇİLER*\n\n"
+    for i, k in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {k['full_name']} — *{k['aylik_davet']}* davet\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
+
+def aylik_sifirla():
+    ay = datetime.utcnow().strftime("%Y-%m")
+    with db() as c:
+        rows = c.execute("SELECT * FROM users WHERE aylik_puan > 0").fetchall()
+        for r in rows:
+            c.execute(
+                "INSERT INTO aylik_arsiv(ay,user_id,full_name,puan,mesaj,davet) VALUES(?,?,?,?,?,?)",
+                (ay, r["user_id"], r["full_name"], r["aylik_puan"], r["aylik_mesaj"], r["aylik_davet"])
+            )
+        c.execute("UPDATE users SET aylik_puan=0, aylik_mesaj=0, aylik_davet=0")
+    logger.info(f"Aylık veriler sıfırlandı: {ay}")
+
+async def aylik_sifirla_job(context: ContextTypes.DEFAULT_TYPE):
+    aylik_sifirla()
+
+async def arsiv_komutu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ay = context.args[0] if context.args else datetime.utcnow().strftime("%Y-%m")
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM aylik_arsiv WHERE ay=? ORDER BY puan DESC LIMIT 10", (ay,)
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text(f"❌ `{ay}` için arşiv yok. Format: `2025-01`", parse_mode=ParseMode.MARKDOWN)
+        return
+    madalya = ["🥇","🥈","🥉"]
+    metin = f"📁 *{ay} Arşivi*\n\n"
+    for i, r in enumerate(rows, 1):
+        m = madalya[i-1] if i <= 3 else f"{i}."
+        metin += f"{m} {r['full_name']} — *{r['puan']} puan* ({r['mesaj']} mesaj, {r['davet']} davet)\n"
+    await update.message.reply_text(metin, parse_mode=ParseMode.MARKDOWN)
+
+@admin_gerekli
+async def manuel_sifirla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    aylik_sifirla()
+    await update.message.reply_text("✅ Aylık veriler sıfırlandı ve arşivlendi.")
 
 # ══════════════════════════════════════════════
 # MAIN
@@ -1187,7 +1482,8 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start",           start_komutu))
-    app.add_handler(CommandHandler("yardim",          yardim_komutu := lambda u,c: u.message.reply_text(YARDIM_METNI, parse_mode=ParseMode.MARKDOWN)))
+    app.add_handler(CommandHandler("yardim",          start_komutu))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
     app.add_handler(CommandHandler("puan",            puan_komutu))
     app.add_handler(CommandHandler("siralama",        siralama_genel))
     app.add_handler(CommandHandler("siralama_mesaj",  siralama_mesaj))
@@ -1232,6 +1528,11 @@ def main():
     app.add_handler(CommandHandler("purge",           purge_komutu))
     app.add_handler(CommandHandler("pin",             pin_komutu))
     app.add_handler(CommandHandler("unpin",           unpin_komutu))
+    app.add_handler(CommandHandler("aylik",           aylik_siralama_genel))
+    app.add_handler(CommandHandler("aylik_mesaj",     aylik_siralama_mesaj))
+    app.add_handler(CommandHandler("aylik_davet",     aylik_siralama_davet))
+    app.add_handler(CommandHandler("arsiv",           arsiv_komutu))
+    app.add_handler(CommandHandler("sifirla",         manuel_sifirla))
     app.add_handler(CommandHandler("admins",          admins_komutu))
     app.add_handler(CommandHandler("report",          report_komutu))
     app.add_handler(CommandHandler("info",            info_komutu))
@@ -1243,6 +1544,17 @@ def main():
 
     app.add_handler(ChatMemberHandler(yeni_uye_handler,    ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(uye_ayrildi_handler, ChatMemberHandler.CHAT_MEMBER))
+
+    # Her ayın 1'i saat 00:00'da otomatik sıfırla (UTC)
+    job_queue = app.job_queue
+    now = datetime.utcnow()
+    if now.month == 12:
+        ilk_gun = datetime(now.year + 1, 1, 1, 0, 0, 0)
+    else:
+        ilk_gun = datetime(now.year, now.month + 1, 1, 0, 0, 0)
+    gecikme = (ilk_gun - now).total_seconds()
+    job_queue.run_once(aylik_sifirla_job, when=gecikme)
+    job_queue.run_repeating(aylik_sifirla_job, interval=30*24*3600, first=gecikme)
 
     logger.info("🦅 Corvus Area Bot başlatıldı!")
     app.run_polling(allowed_updates=["message", "chat_member", "callback_query"])
